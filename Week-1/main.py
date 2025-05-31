@@ -5,112 +5,104 @@ import time
 from datetime import datetime, timedelta, timezone
 from tqdm import tqdm
 
-DB_NAME = "btc_options_week.db"
-CANDLES_CSV = "btc_options_candles.csv"
-DAYS_BACK = 14
-RESOLUTION = "1d"
-DAYS_AHEAD = 7
-STRIKE_SPREAD = 15000
-STRIKE_STEP = 100
-BASE_URL = "https://api.delta.exchange/v2"
-BASE_DATE = datetime(2025, 5, 25, tzinfo=timezone.utc)
+db_path = "weekly_btc_options.db"
+csv_path = "btc_option_candles.csv"
+days_lookback = 14
+interval = "1d"
+days_forward = 7
+strike_padding = 15000
+strike_gap = 100
+api_base = "https://api.delta.exchange/v2"
+reference_day = datetime(2025, 5, 25, tzinfo=timezone.utc)
 
-def get_btc_price():
-    url = f"{BASE_URL}/tickers"
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()['result']
-    for ticker in data:
-        if ticker['symbol'] == "BTCUSDT":
-            return float(ticker['spot_price'])
+tickers_response = requests.get(f"{api_base}/tickers")
+tickers_response.raise_for_status()
+tickers_data = tickers_response.json()["result"]
+btc_price = None
+for item in tickers_data:
+    if item["symbol"] == "BTCUSDT":
+        btc_price = float(item["spot_price"])
+        break
+if btc_price is None:
     raise Exception("BTCUSDT ticker not found")
 
-def fetch_option_products():
-    url = f"{BASE_URL}/products"
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()['result']
+products_response = requests.get(f"{api_base}/products")
+products_response.raise_for_status()
+product_list = products_response.json()["result"]
 
-def store_options_in_db(date_str, data_rows):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(f'''
-        CREATE TABLE IF NOT EXISTS options_{date_str} (
+option_symbols = set()
+
+for shift in tqdm(range(days_forward), desc="Processing days"):
+    current_day = reference_day + timedelta(days=shift)
+    expiry_day = current_day + timedelta(days=3)
+    expiry_code = expiry_day.strftime("%d%m%y")
+    current_key = current_day.strftime("%Y%m%d")
+
+    low_bound = int((btc_price - strike_padding) // strike_gap) * strike_gap
+    high_bound = int((btc_price + strike_padding) // strike_gap) * strike_gap
+    valid_strikes = set(range(low_bound, high_bound + 1, strike_gap))
+
+    collected_entries = []
+
+    for p in product_list:
+        if p["underlying_asset"]["symbol"] != "BTC":
+            continue
+        if p["contract_type"] not in ["call_options", "put_options"]:
+            continue
+        if not p["symbol"].endswith(expiry_code):
+            continue
+        strike = p.get("strike_price")
+        if strike is None or int(strike) not in valid_strikes:
+            continue
+        vol = float(p.get("volume", 0.0))
+        kind = "call" if p["contract_type"] == "call_options" else "put"
+        collected_entries.append((p["symbol"], int(strike), expiry_code, kind, vol))
+        option_symbols.add(p["symbol"])
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS options_{current_key} (
             symbol TEXT,
             strike_price INTEGER,
             expiry TEXT,
             option_type TEXT,
             volume REAL
         )
-    ''')
-    cursor.executemany(f'''
-        INSERT INTO options_{date_str} (symbol, strike_price, expiry, option_type, volume)
+    """)
+    cur.executemany(f"""
+        INSERT INTO options_{current_key} (symbol, strike_price, expiry, option_type, volume)
         VALUES (?, ?, ?, ?, ?)
-    ''', data_rows)
+    """, collected_entries)
     conn.commit()
     conn.close()
 
-def fetch_and_store_candles(symbols):
-    end_time = int(time.time())
-    start_time = end_time - DAYS_BACK * 24 * 60 * 60
-    candles_url = f"{BASE_URL}/history/candles"
-    with open(CANDLES_CSV, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=["symbol", "time", "open", "high", "low", "close", "volume"])
-        writer.writeheader()
-        for symbol in tqdm(symbols, desc="Fetching candles"):
-            params = {
-                "symbol": symbol,
-                "resolution": RESOLUTION,
-                "start": start_time,
-                "end": end_time
-            }
-            response = requests.get(candles_url, params=params)
-            data = response.json()
-            if not (data.get("success") and data.get("result")):
-                continue
-            for candle in data["result"]:
-                writer.writerow({
-                    "symbol": symbol,
-                    "time": datetime.fromtimestamp(candle["time"], timezone.utc).isoformat(),
-                    "open": candle["open"],
-                    "high": candle["high"],
-                    "low": candle["low"],
-                    "close": candle["close"],
-                    "volume": candle["volume"]
-                })
+end_unix = int(time.time())
+start_unix = end_unix - days_lookback * 86400
+candles_endpoint = f"{api_base}/history/candles"
 
-btc_price = get_btc_price()
-all_products = fetch_option_products()
-all_expiring_symbols = set()
+with open(csv_path, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["symbol", "time", "open", "high", "low", "close", "volume"])
+    writer.writeheader()
 
-for i in tqdm(range(DAYS_AHEAD), desc="Processing days"):
-    current_date = BASE_DATE + timedelta(days=i)
-    expiry_date = current_date + timedelta(days=3)
-    expiry_str = expiry_date.strftime("%d%m%y")
-    date_str = current_date.strftime("%Y%m%d")
-
-    lower = int((btc_price - STRIKE_SPREAD) // STRIKE_STEP) * STRIKE_STEP
-    upper = int((btc_price + STRIKE_SPREAD) // STRIKE_STEP) * STRIKE_STEP
-    strike_range = set(range(lower, upper + 1, STRIKE_STEP))
-
-    collected = []
-
-    for product in all_products:
-        if product['underlying_asset']['symbol'] != "BTC":
+    for sym in tqdm(option_symbols, desc="Downloading candles"):
+        params = {
+            "symbol": sym,
+            "resolution": interval,
+            "start": start_unix,
+            "end": end_unix
+        }
+        r = requests.get(candles_endpoint, params=params)
+        result = r.json()
+        if not (result.get("success") and result.get("result")):
             continue
-        if product['contract_type'] not in ['put_options', 'call_options']:
-            continue
-        symbol = product['symbol']
-        if not symbol.endswith(expiry_str):
-            continue
-        strike_price = product.get('strike_price')
-        if strike_price is None or int(strike_price) not in strike_range:
-            continue
-        volume = float(product.get('volume', 0.0))
-        option_type = "call" if product['contract_type'] == "call_options" else "put"
-        collected.append((symbol, int(strike_price), expiry_str, option_type, volume))
-        all_expiring_symbols.add(symbol)
-
-    store_options_in_db(date_str, collected)
-print("here")
-fetch_and_store_candles(list(all_expiring_symbols))
+        for row in result["result"]:
+            writer.writerow({
+                "symbol": sym,
+                "time": datetime.fromtimestamp(row["time"], timezone.utc).isoformat(),
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row["volume"]
+            })
