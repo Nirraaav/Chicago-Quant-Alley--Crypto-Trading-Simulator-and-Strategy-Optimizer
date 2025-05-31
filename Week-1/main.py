@@ -5,8 +5,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from tqdm import tqdm
 
-db_path = "weekly_btc_options.db"
-csv_path = "btc_option_candles.csv"
+db_path = "btc_options_week.db"
+csv_path = "btc_options_candles.csv"
 days_lookback = 14
 interval = "1d"
 days_forward = 7
